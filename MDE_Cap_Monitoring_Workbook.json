@@ -1,0 +1,573 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# 📡 MDE Telemetry Cap Monitor\n\nThis workbook identifies devices that may have hit Microsoft Defender for Endpoint's undocumented telemetry threshold using **multi-day pattern analysis**.\n\n**How we detect the cap:**\nWe look for the telltale signature of a cap hit: **process events drop to zero while other telemetry (network, file, registry) continues flowing normally**. By analysing this pattern over multiple days, we can identify devices that are repeatedly hitting the cap - giving much higher confidence than a point-in-time snapshot.\n\n**Why this approach works:**\n- Caps can happen overnight or during off-hours\n- Different timezones mean different peak activity times\n- A short time window might completely miss a device that hit its cap hours ago\n- Repeating daily patterns are the strongest indicator of a genuine cap issue\n\n---"
+      },
+      "name": "header"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "### ⚙️ Parameters\n\n| Parameter | What it does |\n|-----------|-------------|\n| **Analysis Period** | How many days of historical data to analyse. Longer periods give more confidence but take longer to query. 3 days is recommended. |\n| **Min Hourly Activity** | Minimum non-process events per hour for a device to be considered \"active\" during that hour. Filters out idle periods. |\n| **Show Healthy Devices** | Whether to include healthy devices in the detailed health grid. |"
+      },
+      "name": "parameter-explanation"
+    },
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "a2b5a3e1-7d8c-4f2e-9b6a-1c3d5e7f9a0b",
+            "version": "KqlParameterItem/1.0",
+            "name": "AnalysisPeriodDays",
+            "label": "Analysis Period (Days)",
+            "type": 2,
+            "isRequired": true,
+            "value": "3",
+            "typeSettings": {
+              "additionalResourceOptions": []
+            },
+            "jsonData": "[\"1\", \"2\", \"3\", \"5\", \"7\"]"
+          },
+          {
+            "id": "b3c6d4e2-8e9d-5a3f-0c7b-2d4e6f8a1b3c",
+            "version": "KqlParameterItem/1.0",
+            "name": "MinHourlyActivity",
+            "label": "Min Hourly Activity",
+            "type": 2,
+            "isRequired": true,
+            "value": "10",
+            "typeSettings": {
+              "additionalResourceOptions": []
+            },
+            "jsonData": "[\"5\", \"10\", \"25\", \"50\", \"100\"]"
+          },
+          {
+            "id": "c4d7e5f3-9f0e-6b4a-1d8c-3e5f7a9b2c4d",
+            "version": "KqlParameterItem/1.0",
+            "name": "ShowHealthyDevices",
+            "label": "Show Healthy Devices",
+            "type": 2,
+            "isRequired": true,
+            "value": "No",
+            "typeSettings": {
+              "additionalResourceOptions": []
+            },
+            "jsonData": "[\"Yes\", \"No\"]"
+          }
+        ],
+        "style": "pills",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces"
+      },
+      "name": "parameters"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## 📊 Summary Overview\n\nCounts based on pattern analysis over the selected period. A \"capped hour\" is when a device has **other telemetry flowing but zero process events** - the signature of hitting the MDE telemetry cap."
+      },
+      "name": "summary-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let analysisDays = toint({AnalysisPeriodDays});\nlet minHourlyActivity = toint({MinHourlyActivity});\nlet startTime = ago(totimespan(strcat(tostring(analysisDays), \"d\")));\nlet endTime = now();\n// Get hourly process events per device\nlet processHourly = DeviceProcessEvents\n    | where TimeGenerated >= startTime and TimeGenerated <= endTime\n    | summarize ProcessCount = count() by DeviceId, bin(TimeGenerated, 1h);\n// Get hourly other events per device\nlet otherHourly = union\n    (DeviceNetworkEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime),\n    (DeviceFileEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime),\n    (DeviceRegistryEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime)\n    | summarize OtherCount = count() by DeviceId, bin(TimeGenerated, 1h);\n// Get device info for server detection\nlet deviceInfo = DeviceInfo\n    | where TimeGenerated > ago(7d)\n    | summarize arg_max(TimeGenerated, *) by DeviceId\n    | project DeviceId, OSPlatform, DeviceType;\n// Find \"capped hours\" - hours where device has other activity but no process events\nlet cappedHours = otherHourly\n    | where OtherCount >= minHourlyActivity\n    | join kind=leftanti processHourly on DeviceId, TimeGenerated\n    | summarize CappedHours = count(), CappedDays = dcount(bin(TimeGenerated, 1d)) by DeviceId;\n// Categorize devices\nlet highConfidence = cappedHours\n    | where CappedDays >= 2 and CappedHours >= 4\n    | count\n    | extend Metric = \"🔴 High Confidence Cap\", Order = 1;\nlet mediumConfidence = cappedHours\n    | where CappedDays == 1 and CappedHours >= 2\n    | count\n    | extend Metric = \"🟠 Medium Confidence\", Order = 2;\nlet lowConfidence = cappedHours\n    | where CappedHours == 1\n    | count\n    | extend Metric = \"🟡 Low Confidence\", Order = 3;\n// Count servers hitting cap\nlet serversCapped = cappedHours\n    | join kind=inner deviceInfo on DeviceId\n    | where OSPlatform contains \"Server\" or DeviceType == \"Server\"\n    | count\n    | extend Metric = \"🖥️ High Confidence - Servers Capped\", Order = 4;\nlet totalAnalysed = union\n    (processHourly | summarize by DeviceId),\n    (otherHourly | summarize by DeviceId)\n    | summarize by DeviceId\n    | count\n    | extend Metric = \"📱 Total Devices Analysed\", Order = 5;\nunion highConfidence, mediumConfidence, lowConfidence, serversCapped, totalAnalysed\n| order by Order asc\n| project Metric, Count",
+        "size": 4,
+        "title": "Device Telemetry Cap Detection Summary",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "tiles",
+        "tileSettings": {
+          "titleContent": {
+            "columnMatch": "Metric",
+            "formatter": 1
+          },
+          "leftContent": {
+            "columnMatch": "Count",
+            "formatter": 12,
+            "formatOptions": {
+              "palette": "auto"
+            },
+            "numberFormat": {
+              "unit": 17,
+              "options": {
+                "style": "decimal",
+                "maximumFractionDigits": 0
+              }
+            }
+          },
+          "showBorder": true,
+          "size": "auto"
+        }
+      },
+      "name": "summary-tiles"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## 🖥️ PRIORITY: Servers Hitting Telemetry Cap\n\nServers showing the telemetry cap pattern: **process events have dropped to zero while network, file, and registry events continue flowing**. These are high-value systems where detection blind spots are most dangerous.\n\n**Confidence levels:**\n- 🔴 **High:** Capped hours detected across 2+ days (pattern is repeating)\n- 🟠 **Medium:** Multiple capped hours on a single day\n- 🟡 **Low:** Single capped hour detected"
+      },
+      "name": "servers-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let analysisDays = toint({AnalysisPeriodDays});\nlet minHourlyActivity = toint({MinHourlyActivity});\nlet startTime = ago(totimespan(strcat(tostring(analysisDays), \"d\")));\nlet endTime = now();\n// Get hourly process events per device\nlet processHourly = DeviceProcessEvents\n    | where TimeGenerated >= startTime and TimeGenerated <= endTime\n    | summarize ProcessCount = count() by DeviceId, DeviceName, bin(TimeGenerated, 1h);\n// Get hourly other events per device  \nlet otherHourly = union\n    (DeviceNetworkEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime),\n    (DeviceFileEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime),\n    (DeviceRegistryEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime)\n    | summarize OtherCount = count() by DeviceId, bin(TimeGenerated, 1h);\n// Get device info\nlet deviceInfo = DeviceInfo\n    | where TimeGenerated > ago(7d)\n    | summarize arg_max(TimeGenerated, *) by DeviceId\n    | project DeviceId, DeviceName, OSPlatform, DeviceType, MachineGroup;\n// Find capped hours with details\nlet cappedAnalysis = otherHourly\n    | where OtherCount >= minHourlyActivity\n    | join kind=leftanti processHourly on DeviceId, TimeGenerated\n    | summarize \n        CappedHours = count(),\n        CappedDays = dcount(bin(TimeGenerated, 1d)),\n        FirstCap = min(TimeGenerated),\n        LastCap = max(TimeGenerated),\n        TypicalCapHour = percentile(hourofday(TimeGenerated), 50),\n        TotalOtherEvents = sum(OtherCount)\n    by DeviceId;\n// Join with device info and filter for servers\ncappedAnalysis\n| join kind=inner deviceInfo on DeviceId\n| where OSPlatform contains \"Server\" or DeviceType == \"Server\"\n| extend Confidence = case(\n    CappedDays >= 2 and CappedHours >= 4, \"🔴 High\",\n    CappedDays >= 1 and CappedHours >= 2, \"🟠 Medium\",\n    \"🟡 Low\"\n)\n| project \n    Confidence,\n    DeviceName,\n    CappedHours,\n    CappedDays,\n    TypicalCapHour = strcat(tostring(TypicalCapHour), \":00\"),\n    TotalOtherEvents,\n    FirstCap = format_datetime(FirstCap, 'yyyy-MM-dd HH:mm'),\n    LastCap = format_datetime(LastCap, 'yyyy-MM-dd HH:mm'),\n    OSPlatform,\n    MachineGroup = coalesce(MachineGroup, \"Unknown\")\n| order by Confidence asc, CappedHours desc",
+        "size": 0,
+        "title": "🚨 Servers - Process Events Dropped While Other Telemetry Continues",
+        "noDataMessage": "✅ No servers showing telemetry cap patterns",
+        "noDataMessageStyle": 3,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "Confidence",
+              "formatter": 1
+            },
+            {
+              "columnMatch": "CappedHours",
+              "formatter": 8,
+              "formatOptions": {
+                "palette": "yellowOrangeRed"
+              }
+            },
+            {
+              "columnMatch": "CappedDays",
+              "formatter": 8,
+              "formatOptions": {
+                "palette": "yellowOrangeRed"
+              }
+            },
+            {
+              "columnMatch": "TotalOtherEvents",
+              "formatter": 4,
+              "formatOptions": {
+                "palette": "blue"
+              }
+            }
+          ]
+        },
+        "sortBy": []
+      },
+      "name": "servers-capped-query"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let analysisDays = toint({AnalysisPeriodDays});\nlet minHourlyActivity = toint({MinHourlyActivity});\nlet startTime = ago(totimespan(strcat(tostring(analysisDays), \"d\")));\nlet endTime = now();\n// Get hourly process events per device\nlet processHourly = DeviceProcessEvents\n    | where TimeGenerated >= startTime and TimeGenerated <= endTime\n    | summarize ProcessCount = count() by DeviceId, bin(TimeGenerated, 1h);\n// Get hourly other events per device  \nlet otherHourly = union\n    (DeviceNetworkEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime),\n    (DeviceFileEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime),\n    (DeviceRegistryEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime)\n    | summarize OtherCount = count() by DeviceId, bin(TimeGenerated, 1h);\n// Get device info for servers\nlet deviceInfo = DeviceInfo\n    | where TimeGenerated > ago(7d)\n    | summarize arg_max(TimeGenerated, *) by DeviceId\n    | project DeviceId, DeviceName, OSPlatform, DeviceType;\n// Find capped servers\nlet cappedServers = otherHourly\n    | where OtherCount >= minHourlyActivity\n    | join kind=leftanti processHourly on DeviceId, TimeGenerated\n    | summarize CappedHours = count() by DeviceId\n    | join kind=inner deviceInfo on DeviceId\n    | where OSPlatform contains \"Server\" or DeviceType == \"Server\"\n    | project DeviceId;\n// Get top processes from these capped servers\nDeviceProcessEvents\n| where TimeGenerated >= startTime and TimeGenerated <= endTime\n| where DeviceId in (cappedServers)\n| summarize \n    EventCount = count(),\n    DevicesAffected = dcount(DeviceId),\n    SampleCommandLine = take_any(ProcessCommandLine)\n by FileName, FolderPath\n| order by EventCount desc\n| take 5\n| project \n    Rank = row_number(),\n    ProcessName = FileName,\n    EventCount,\n    DevicesAffected,\n    FolderPath,\n    SampleCommandLine = substring(SampleCommandLine, 0, 150)",
+        "size": 0,
+        "title": "🔧 Top 5 Processes on Capped Servers - Review for Exclusions",
+        "noDataMessage": "No process data available for capped servers",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "Rank",
+              "formatter": 1
+            },
+            {
+              "columnMatch": "EventCount",
+              "formatter": 8,
+              "formatOptions": {
+                "palette": "yellowOrangeRed"
+              }
+            },
+            {
+              "columnMatch": "DevicesAffected",
+              "formatter": 4,
+              "formatOptions": {
+                "palette": "blue"
+              }
+            }
+          ]
+        },
+        "sortBy": []
+      },
+      "name": "top-processes-capped-servers"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## 🔴 All Devices - High Confidence Cap Detections\n\nAll devices (including workstations) showing the telemetry cap pattern across **multiple days**. The repeating pattern indicates this is likely a daily cap being hit, not a one-off issue.\n\n**What we're detecting:** Hours where **process events = 0** but **other telemetry (network/file/registry) continues normally**. This is the signature of hitting the MDE telemetry cap.\n\n> 🎯 **High confidence** = Capped hours detected on 2+ different days AND total of 4+ capped hours"
+      },
+      "name": "high-confidence-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let analysisDays = toint({AnalysisPeriodDays});\nlet minHourlyActivity = toint({MinHourlyActivity});\nlet startTime = ago(totimespan(strcat(tostring(analysisDays), \"d\")));\nlet endTime = now();\n// Get hourly process events per device\nlet processHourly = DeviceProcessEvents\n    | where TimeGenerated >= startTime and TimeGenerated <= endTime\n    | summarize ProcessCount = count() by DeviceId, DeviceName, bin(TimeGenerated, 1h);\n// Get hourly other events per device  \nlet otherHourly = union\n    (DeviceNetworkEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime),\n    (DeviceFileEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime),\n    (DeviceRegistryEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime)\n    | summarize OtherCount = count() by DeviceId, bin(TimeGenerated, 1h);\n// Get device info\nlet deviceInfo = DeviceInfo\n    | where TimeGenerated > ago(7d)\n    | summarize arg_max(TimeGenerated, *) by DeviceId\n    | project DeviceId, DeviceName, OSPlatform, DeviceType, MachineGroup;\n// Find capped hours with details\nlet cappedAnalysis = otherHourly\n    | where OtherCount >= minHourlyActivity\n    | join kind=leftanti processHourly on DeviceId, TimeGenerated\n    | summarize \n        CappedHours = count(),\n        CappedDays = dcount(bin(TimeGenerated, 1d)),\n        FirstCap = min(TimeGenerated),\n        LastCap = max(TimeGenerated),\n        TypicalCapHour = percentile(hourofday(TimeGenerated), 50),\n        TotalOtherEvents = sum(OtherCount)\n    by DeviceId;\n// Filter for high confidence\ncappedAnalysis\n| where CappedDays >= 2 and CappedHours >= 4\n| join kind=leftouter deviceInfo on DeviceId\n| project \n    DeviceName = coalesce(DeviceName, \"Unknown\"),\n    CappedHours,\n    CappedDays,\n    TypicalCapHour = strcat(tostring(TypicalCapHour), \":00\"),\n    TotalOtherEvents,\n    FirstCap = format_datetime(FirstCap, 'yyyy-MM-dd HH:mm'),\n    LastCap = format_datetime(LastCap, 'yyyy-MM-dd HH:mm'),\n    OSPlatform = coalesce(OSPlatform, \"Unknown\"),\n    DeviceType = coalesce(DeviceType, \"Unknown\"),\n    MachineGroup = coalesce(MachineGroup, \"Unknown\")\n| order by CappedHours desc, CappedDays desc",
+        "size": 0,
+        "title": "High Confidence - Process Events Dropping on Multiple Days",
+        "noDataMessage": "✅ No devices showing high-confidence telemetry cap patterns",
+        "noDataMessageStyle": 3,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "CappedHours",
+              "formatter": 8,
+              "formatOptions": {
+                "palette": "yellowOrangeRed"
+              }
+            },
+            {
+              "columnMatch": "CappedDays",
+              "formatter": 8,
+              "formatOptions": {
+                "palette": "yellowOrangeRed"
+              }
+            },
+            {
+              "columnMatch": "TotalOtherEvents",
+              "formatter": 4,
+              "formatOptions": {
+                "palette": "blue"
+              }
+            }
+          ]
+        },
+        "sortBy": []
+      },
+      "name": "high-confidence-query"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## 🟠 Medium & Low Confidence Detections\n\nDevices with some capped hours but less certainty. These show the pattern of **process events dropping while other telemetry continues**, but not consistently enough to be high confidence.\n\nCould be:\n- Early signs of a cap issue developing\n- One-off sensor issues\n- Devices that were genuinely offline but had residual network activity"
+      },
+      "name": "medium-low-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let analysisDays = toint({AnalysisPeriodDays});\nlet minHourlyActivity = toint({MinHourlyActivity});\nlet startTime = ago(totimespan(strcat(tostring(analysisDays), \"d\")));\nlet endTime = now();\n// Get hourly process events per device\nlet processHourly = DeviceProcessEvents\n    | where TimeGenerated >= startTime and TimeGenerated <= endTime\n    | summarize ProcessCount = count() by DeviceId, DeviceName, bin(TimeGenerated, 1h);\n// Get hourly other events per device  \nlet otherHourly = union\n    (DeviceNetworkEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime),\n    (DeviceFileEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime),\n    (DeviceRegistryEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime)\n    | summarize OtherCount = count() by DeviceId, bin(TimeGenerated, 1h);\n// Get device info\nlet deviceInfo = DeviceInfo\n    | where TimeGenerated > ago(7d)\n    | summarize arg_max(TimeGenerated, *) by DeviceId\n    | project DeviceId, DeviceName, OSPlatform, DeviceType, MachineGroup;\n// Find capped hours with details\nlet cappedAnalysis = otherHourly\n    | where OtherCount >= minHourlyActivity\n    | join kind=leftanti processHourly on DeviceId, TimeGenerated\n    | summarize \n        CappedHours = count(),\n        CappedDays = dcount(bin(TimeGenerated, 1d)),\n        FirstCap = min(TimeGenerated),\n        LastCap = max(TimeGenerated),\n        TotalOtherEvents = sum(OtherCount)\n    by DeviceId;\n// Filter for medium/low confidence (exclude high confidence)\ncappedAnalysis\n| where not(CappedDays >= 2 and CappedHours >= 4)\n| join kind=leftouter deviceInfo on DeviceId\n| extend Confidence = case(\n    CappedDays >= 1 and CappedHours >= 2, \"🟠 Medium\",\n    \"🟡 Low\"\n)\n| project \n    Confidence,\n    DeviceName = coalesce(DeviceName, \"Unknown\"),\n    CappedHours,\n    CappedDays,\n    TotalOtherEvents,\n    FirstCap = format_datetime(FirstCap, 'yyyy-MM-dd HH:mm'),\n    LastCap = format_datetime(LastCap, 'yyyy-MM-dd HH:mm'),\n    OSPlatform = coalesce(OSPlatform, \"Unknown\"),\n    DeviceType = coalesce(DeviceType, \"Unknown\")\n| order by Confidence asc, CappedHours desc",
+        "size": 0,
+        "title": "Medium & Low Confidence Detections",
+        "noDataMessage": "✅ No additional devices with cap patterns",
+        "noDataMessageStyle": 3,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "Confidence",
+              "formatter": 1
+            },
+            {
+              "columnMatch": "CappedHours",
+              "formatter": 8,
+              "formatOptions": {
+                "palette": "yellow"
+              }
+            },
+            {
+              "columnMatch": "TotalOtherEvents",
+              "formatter": 4,
+              "formatOptions": {
+                "palette": "blue"
+              }
+            }
+          ]
+        },
+        "sortBy": []
+      },
+      "name": "medium-low-query"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## 📈 Cap Pattern Timing Analysis\n\nWhen are devices hitting the cap? This helps identify:\n- Time-of-day patterns (e.g., always hits cap at 2pm)\n- Day-of-week patterns (e.g., more caps on busy weekdays)\n- Whether caps are clustered or spread out"
+      },
+      "name": "timing-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let analysisDays = toint({AnalysisPeriodDays});\nlet minHourlyActivity = toint({MinHourlyActivity});\nlet startTime = ago(totimespan(strcat(tostring(analysisDays), \"d\")));\nlet endTime = now();\n// Get hourly process events per device\nlet processHourly = DeviceProcessEvents\n    | where TimeGenerated >= startTime and TimeGenerated <= endTime\n    | summarize ProcessCount = count() by DeviceId, bin(TimeGenerated, 1h);\n// Get hourly other events per device  \nlet otherHourly = union\n    (DeviceNetworkEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime),\n    (DeviceFileEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime),\n    (DeviceRegistryEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime)\n    | summarize OtherCount = count() by DeviceId, bin(TimeGenerated, 1h);\n// Find capped hours\notherHourly\n| where OtherCount >= minHourlyActivity\n| join kind=leftanti processHourly on DeviceId, TimeGenerated\n| summarize CappedDevices = dcount(DeviceId) by bin(TimeGenerated, 1h)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Devices Showing Cap Pattern Over Time (Hourly)",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "areachart",
+        "chartSettings": {
+          "seriesLabelSettings": [
+            {
+              "seriesName": "CappedDevices",
+              "label": "Devices with Process Drop",
+              "color": "redBright"
+            }
+          ]
+        }
+      },
+      "name": "cap-timing-chart"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let analysisDays = toint({AnalysisPeriodDays});\nlet minHourlyActivity = toint({MinHourlyActivity});\nlet startTime = ago(totimespan(strcat(tostring(analysisDays), \"d\")));\nlet endTime = now();\n// Get hourly process events per device\nlet processHourly = DeviceProcessEvents\n    | where TimeGenerated >= startTime and TimeGenerated <= endTime\n    | summarize ProcessCount = count() by DeviceId, bin(TimeGenerated, 1h);\n// Get hourly other events per device  \nlet otherHourly = union\n    (DeviceNetworkEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime),\n    (DeviceFileEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime),\n    (DeviceRegistryEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime)\n    | summarize OtherCount = count() by DeviceId, bin(TimeGenerated, 1h);\n// Find capped hours by hour of day\notherHourly\n| where OtherCount >= minHourlyActivity\n| join kind=leftanti processHourly on DeviceId, TimeGenerated\n| extend HourOfDay = hourofday(TimeGenerated)\n| summarize CapInstances = count(), UniqueDevices = dcount(DeviceId) by HourOfDay\n| order by HourOfDay asc\n| project \n    Hour = strcat(format_datetime(datetime(2000-01-01) + totimespan(strcat(tostring(HourOfDay), \"h\")), 'HH:mm')),\n    CapInstances,\n    UniqueDevices",
+        "size": 0,
+        "title": "Cap Distribution by Hour of Day (UTC)",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "categoricalbar",
+        "chartSettings": {
+          "xAxis": "Hour",
+          "seriesLabelSettings": [
+            {
+              "seriesName": "CapInstances",
+              "label": "Cap Instances",
+              "color": "orange"
+            },
+            {
+              "seriesName": "UniqueDevices",
+              "color": "blue"
+            }
+          ]
+        }
+      },
+      "name": "cap-by-hour-chart"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## 🟡 High Volume Devices - At Risk of Hitting Cap\n\nDevices generating high telemetry volumes that may hit the cap in the future. This is an **early warning** section - these devices haven't necessarily hit the cap yet, but their volume suggests they're at risk."
+      },
+      "name": "high-volume-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let analysisDays = toint({AnalysisPeriodDays});\nlet startTime = ago(totimespan(strcat(tostring(analysisDays), \"d\")));\nlet endTime = now();\n// First, get hourly event counts per device\nlet hourlyEvents = DeviceProcessEvents\n    | where TimeGenerated >= startTime and TimeGenerated <= endTime\n    | summarize HourlyCount = count() by DeviceId, DeviceName, bin(TimeGenerated, 1h);\n// Now aggregate across hours\nhourlyEvents\n| summarize \n    TotalEvents = sum(HourlyCount),\n    ActiveHours = count(),\n    MaxHourlyEvents = max(HourlyCount),\n    AvgHourlyEvents = avg(HourlyCount)\nby DeviceId, DeviceName\n| extend AvgEventsPerActiveHour = round(AvgHourlyEvents, 0)\n| extend RiskLevel = case(\n    AvgEventsPerActiveHour > 5000, \"🔴 Critical\",\n    AvgEventsPerActiveHour > 2000, \"🟠 High\", \n    AvgEventsPerActiveHour > 1000, \"🟡 Elevated\",\n    \"🟢 Normal\"\n)\n| where AvgEventsPerActiveHour > 1000\n| join kind=leftouter (\n    DeviceInfo\n    | where TimeGenerated > ago(7d)\n    | summarize arg_max(TimeGenerated, *) by DeviceId\n    | project DeviceId, OSPlatform, DeviceType\n) on DeviceId\n| project \n    RiskLevel,\n    DeviceName,\n    TotalEvents,\n    ActiveHours,\n    AvgEventsPerActiveHour,\n    MaxHourlyEvents,\n    OSPlatform = coalesce(OSPlatform, \"Unknown\"),\n    DeviceType = coalesce(DeviceType, \"Unknown\")\n| order by AvgEventsPerActiveHour desc",
+        "size": 0,
+        "title": "High Volume Devices (Avg Events/Active Hour > 1000)",
+        "noDataMessage": "✅ No high-volume devices detected",
+        "noDataMessageStyle": 3,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "RiskLevel",
+              "formatter": 1
+            },
+            {
+              "columnMatch": "AvgEventsPerActiveHour",
+              "formatter": 8,
+              "formatOptions": {
+                "palette": "yellowOrangeRed"
+              }
+            },
+            {
+              "columnMatch": "TotalEvents",
+              "formatter": 4,
+              "formatOptions": {
+                "palette": "blue"
+              }
+            },
+            {
+              "columnMatch": "MaxHourlyEvents",
+              "formatter": 4,
+              "formatOptions": {
+                "palette": "orange"
+              }
+            }
+          ]
+        },
+        "sortBy": []
+      },
+      "name": "high-volume-query"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## 📊 Overall Telemetry Health Trends\n\nCompare process events vs other telemetry types over the analysis period. In a healthy environment, all event types should follow similar patterns. **Look for divergence** - if process events drop while others continue, that's the cap signature."
+      },
+      "name": "trends-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let analysisDays = toint({AnalysisPeriodDays});\nlet startTime = ago(totimespan(strcat(tostring(analysisDays), \"d\")));\nlet endTime = now();\nunion\n    (DeviceProcessEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime | extend EventType = \"Process\"),\n    (DeviceNetworkEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime | extend EventType = \"Network\"),\n    (DeviceFileEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime | extend EventType = \"File\"),\n    (DeviceRegistryEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime | extend EventType = \"Registry\")\n| summarize Count = count() by EventType, bin(TimeGenerated, 1h)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "All Event Types Over Time (Hourly)",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "linechart",
+        "chartSettings": {
+          "seriesLabelSettings": [
+            {
+              "seriesName": "Process",
+              "color": "blue"
+            },
+            {
+              "seriesName": "Network",
+              "color": "green"
+            },
+            {
+              "seriesName": "File",
+              "color": "orange"
+            },
+            {
+              "seriesName": "Registry",
+              "color": "purple"
+            }
+          ]
+        }
+      },
+      "name": "event-type-trend-chart"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## 🔍 Device Deep Dive\n\nType a device name to investigate its telemetry pattern over the analysis period. **Look for hours where the blue line (Process) drops to zero while other colours continue** - this is the cap signature."
+      },
+      "name": "deep-dive-header"
+    },
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "d5e8f6a4-0a1b-7c8d-2e3f-4a5b6c7d8e9f",
+            "version": "KqlParameterItem/1.0",
+            "name": "DeviceNameSearch",
+            "label": "Device Name (type to search)",
+            "type": 1,
+            "description": "Enter a device name or partial name to search",
+            "value": ""
+          }
+        ],
+        "style": "pills",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces"
+      },
+      "name": "device-search-input"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let analysisDays = toint({AnalysisPeriodDays});\nlet startTime = ago(totimespan(strcat(tostring(analysisDays), \"d\")));\nlet endTime = now();\nlet searchTerm = \"{DeviceNameSearch}\";\nlet matchingDevices = DeviceInfo\n    | where TimeGenerated > ago(7d)\n    | where isnotempty(searchTerm) and DeviceName contains searchTerm\n    | summarize arg_max(TimeGenerated, *) by DeviceId\n    | project DeviceId, DeviceName, OSPlatform, DeviceType\n    | take 10;\nmatchingDevices\n| project DeviceName, OSPlatform, DeviceType, DeviceId",
+        "size": 0,
+        "title": "Matching Devices",
+        "noDataMessage": "No matching devices found",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "DeviceId",
+              "formatter": 5
+            }
+          ]
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "DeviceNameSearch",
+        "comparison": "isNotEqualTo"
+      },
+      "name": "matching-devices-list"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let analysisDays = toint({AnalysisPeriodDays});\nlet startTime = ago(totimespan(strcat(tostring(analysisDays), \"d\")));\nlet endTime = now();\nlet searchTerm = \"{DeviceNameSearch}\";\nlet matchingDeviceIds = DeviceInfo\n    | where TimeGenerated > ago(7d)\n    | where isnotempty(searchTerm) and DeviceName contains searchTerm\n    | summarize by DeviceId\n    | take 1;\nunion\n    (DeviceProcessEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime | where DeviceId in (matchingDeviceIds) | extend EventType = \"Process\"),\n    (DeviceNetworkEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime | where DeviceId in (matchingDeviceIds) | extend EventType = \"Network\"),\n    (DeviceFileEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime | where DeviceId in (matchingDeviceIds) | extend EventType = \"File\"),\n    (DeviceRegistryEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime | where DeviceId in (matchingDeviceIds) | extend EventType = \"Registry\")\n| summarize Count = count() by EventType, bin(TimeGenerated, 1h)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Device Telemetry Timeline - Look for Process Drops While Others Continue",
+        "noDataMessage": "No telemetry data found",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "linechart",
+        "chartSettings": {
+          "seriesLabelSettings": [
+            {
+              "seriesName": "Process",
+              "color": "blue"
+            },
+            {
+              "seriesName": "Network",
+              "color": "green"
+            },
+            {
+              "seriesName": "File",
+              "color": "orange"
+            },
+            {
+              "seriesName": "Registry",
+              "color": "purple"
+            }
+          ]
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "DeviceNameSearch",
+        "comparison": "isNotEqualTo"
+      },
+      "name": "device-timeline-chart"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "let analysisDays = toint({AnalysisPeriodDays});\nlet minHourlyActivity = toint({MinHourlyActivity});\nlet startTime = ago(totimespan(strcat(tostring(analysisDays), \"d\")));\nlet endTime = now();\nlet searchTerm = \"{DeviceNameSearch}\";\nlet matchingDeviceIds = DeviceInfo\n    | where TimeGenerated > ago(7d)\n    | where isnotempty(searchTerm) and DeviceName contains searchTerm\n    | summarize by DeviceId\n    | take 1;\n// Get hourly process events\nlet processHourly = DeviceProcessEvents\n    | where TimeGenerated >= startTime and TimeGenerated <= endTime\n    | where DeviceId in (matchingDeviceIds)\n    | summarize ProcessCount = count() by bin(TimeGenerated, 1h);\n// Get hourly other events\nlet otherHourly = union\n    (DeviceNetworkEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime | where DeviceId in (matchingDeviceIds)),\n    (DeviceFileEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime | where DeviceId in (matchingDeviceIds)),\n    (DeviceRegistryEvents | where TimeGenerated >= startTime and TimeGenerated <= endTime | where DeviceId in (matchingDeviceIds))\n    | summarize OtherCount = count() by bin(TimeGenerated, 1h);\n// Show capped hours for this device\notherHourly\n| where OtherCount >= minHourlyActivity\n| join kind=leftouter processHourly on TimeGenerated\n| extend ProcessCount = coalesce(ProcessCount, 0)\n| where ProcessCount == 0\n| project \n    CappedHour = format_datetime(TimeGenerated, 'yyyy-MM-dd HH:mm'),\n    ProcessEvents = ProcessCount,\n    OtherEvents = OtherCount,\n    Status = \"🔴 Process Dropped - Other Telemetry Continued\"\n| order by CappedHour desc",
+        "size": 0,
+        "title": "Detected Capped Hours - Process Events Zero, Other Telemetry Active",
+        "noDataMessage": "✅ No capped hours detected for this device",
+        "noDataMessageStyle": 3,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "OtherEvents",
+              "formatter": 4,
+              "formatOptions": {
+                "palette": "blue"
+              }
+            }
+          ]
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "DeviceNameSearch",
+        "comparison": "isNotEqualTo"
+      },
+      "name": "device-capped-hours"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "---\n## ℹ️ About This Workbook\n\n**Purpose:** Monitor for Microsoft Defender for Endpoint telemetry cap hits using pattern analysis\n\n**Detection methodology:**\nWe detect the cap by looking for its signature: **process events drop to zero while other telemetry (network, file, registry) continues flowing normally**.\n\n1. Analyse telemetry over multiple days (configurable, default 3 days)\n2. Bin data by hour to identify periods of activity\n3. Flag hours where a device has other telemetry flowing (≥ min threshold) but zero process events\n4. Score devices by how many \"capped hours\" they have and across how many days\n5. Higher confidence = more capped hours across more days = repeating pattern\n\n**Why pattern analysis is better than point-in-time:**\n- Catches caps that happen overnight or off-hours\n- Works across different timezones\n- Identifies repeating daily patterns (strongest indicator of genuine cap)\n- Reduces false positives from one-off issues\n\n**Confidence levels:**\n| Level | Criteria |\n|-------|----------|\n| 🔴 High | 4+ capped hours across 2+ different days |\n| 🟠 Medium | 2+ capped hours on a single day |\n| 🟡 Low | Single capped hour detected |\n\n**Recommended actions:**\n1. Start with High Confidence detections\n2. Prioritise Servers\n3. Use Deep Dive to visualise the pattern\n4. Consider tuning MDE sensor settings or exclusions\n5. Open a Microsoft support case if persistent\n\n---\n*Workbook Version: 2.1 | Last Updated: 2025*"
+      },
+      "name": "about-section"
+    }
+  ],
+  "fromTemplateId": "sentinel-UserWorkbook",
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}
